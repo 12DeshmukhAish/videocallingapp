@@ -1,12 +1,14 @@
 'use client';
 
 import { useState, useEffect } from 'react';
-import { useSearchParams } from 'next/navigation';
+import { useSearchParams, useRouter } from 'next/navigation';
 import AgoraRTC from 'agora-rtc-sdk-ng';
+
 const APP_ID = process.env.NEXT_PUBLIC_AGORA_APP_ID;
 
 export default function VideoCall() {
   const searchParams = useSearchParams();
+  const router = useRouter();
   const [client, setClient] = useState(null);
   const [localVideoTrack, setLocalVideoTrack] = useState(null);
   const [localAudioTrack, setLocalAudioTrack] = useState(null);
@@ -16,19 +18,15 @@ export default function VideoCall() {
   const [isCameraOn, setIsCameraOn] = useState(true);
   const [isScreenSharing, setIsScreenSharing] = useState(false);
   const [screenTrack, setScreenTrack] = useState(null);
-  const [joinState, setJoinState] = useState('init'); // 'init', 'joining', 'joined'
+  const [joinState, setJoinState] = useState('init');
   const [roomId, setRoomId] = useState('');
   const [shareableLink, setShareableLink] = useState('');
+  const [userMap, setUserMap] = useState(new Map());
 
   useEffect(() => {
-    // Check if we're joining an existing room
     const roomFromUrl = searchParams.get('room');
     if (roomFromUrl) {
       setRoomId(roomFromUrl);
-    } else {
-      // Generate a new room ID if none exists
-      const newRoomId = Math.random().toString(36).substring(7);
-      setRoomId(newRoomId);
     }
   }, [searchParams]);
 
@@ -39,45 +37,231 @@ export default function VideoCall() {
     }
   }, [roomId]);
 
+  const createNewMeeting = () => {
+    const newRoomId = Math.random().toString(36).substring(7);
+    router.push(`/video-call?room=${newRoomId}`);
+  };
+
+  const copyLinkToClipboard = async () => {
+    try {
+      await navigator.clipboard.writeText(shareableLink);
+      alert('Meeting link copied to clipboard!');
+    } catch (err) {
+      console.error('Failed to copy link:', err);
+      const tempInput = document.createElement('input');
+      tempInput.value = shareableLink;
+      document.body.appendChild(tempInput);
+      tempInput.select();
+      document.execCommand('copy');
+      document.body.removeChild(tempInput);
+      alert('Meeting link copied to clipboard!');
+    }
+  };
+
+  const toggleMute = () => {
+    if (localAudioTrack) {
+      localAudioTrack.setEnabled(!isMuted);
+      setIsMuted(!isMuted);
+    }
+  };
+
+  const toggleCamera = () => {
+    if (localVideoTrack) {
+      localVideoTrack.setEnabled(!isCameraOn);
+      setIsCameraOn(!isCameraOn);
+    }
+  };
+
+  const toggleScreenSharing = async () => {
+    if (!client) return;
+
+    if (isScreenSharing) {
+      try {
+        if (screenTrack) {
+          await client.unpublish(screenTrack);
+          screenTrack.stop();
+          screenTrack.close();
+          setScreenTrack(null);
+          setIsScreenSharing(false);
+
+          // Republish and play local video track
+          if (localVideoTrack) {
+            await client.publish(localVideoTrack);
+            localVideoTrack.play('local-video');
+          }
+        }
+      } catch (error) {
+        console.error('Error stopping screen share:', error);
+      }
+    } else {
+      try {
+        // Stop publishing local video track
+        if (localVideoTrack) {
+          await client.unpublish(localVideoTrack);
+        }
+
+        const screenTrackTemp = await AgoraRTC.createScreenVideoTrack({
+          encoderConfig: "1080p_1",
+          optimizationMode: "detail"
+        });
+
+        // Publish screen track
+        await client.publish(screenTrackTemp);
+        screenTrackTemp.play('local-video');
+        setScreenTrack(screenTrackTemp);
+        setIsScreenSharing(true);
+
+        // Handle screen sharing stopped from browser control
+        screenTrackTemp.on('track-ended', async () => {
+          await client.unpublish(screenTrackTemp);
+          screenTrackTemp.stop();
+          screenTrackTemp.close();
+          setScreenTrack(null);
+          setIsScreenSharing(false);
+
+          // Republish and play local video track
+          if (localVideoTrack) {
+            await client.publish(localVideoTrack);
+            localVideoTrack.play('local-video');
+          }
+        });
+      } catch (error) {
+        console.error('Error sharing screen:', error);
+        // Republish local video track if screen sharing fails
+        if (localVideoTrack) {
+          await client.publish(localVideoTrack);
+          localVideoTrack.play('local-video');
+        }
+      }
+    }
+  };
+
+  const endCall = async () => {
+    try {
+      if (localAudioTrack) {
+        localAudioTrack.stop();
+        localAudioTrack.close();
+      }
+      if (localVideoTrack) {
+        localVideoTrack.stop();
+        localVideoTrack.close();
+      }
+      if (screenTrack) {
+        screenTrack.stop();
+        screenTrack.close();
+      }
+      if (client) {
+        await client.leave();
+      }
+
+      setClient(null);
+      setLocalAudioTrack(null);
+      setLocalVideoTrack(null);
+      setScreenTrack(null);
+      setUsers([]);
+      setUserMap(new Map());
+      setJoinState('init');
+
+      const newRoomId = Math.random().toString(36).substring(7);
+      router.push(`/video-call?room=${newRoomId}`);
+    } catch (error) {
+      console.error('Error ending call:', error);
+    }
+  };
+
   const initializeCall = async (name) => {
-    if (joinState !== 'init') return;
-    
+    if (joinState !== 'init' || !roomId) return;
+
     setJoinState('joining');
     setUserName(name);
 
     try {
-      const agoraClient = AgoraRTC.createClient({ mode: 'rtc', codec: 'vp8' });
+      const agoraClient = AgoraRTC.createClient({ 
+        mode: 'rtc', 
+        codec: 'vp8'
+      });
+      
       setClient(agoraClient);
+
+      // Join the channel
+      const uid = await agoraClient.join(APP_ID, roomId, null, null);
       
-      await agoraClient.join(APP_ID, roomId, null, null);
+      // Create and store channel attributes for user name
+      agoraClient.addInjectStreamUrl = name;
       
-      const [audioTrack, videoTrack] = await AgoraRTC.createMicrophoneAndCameraTracks();
+      // Store the local user's name
+      setUserMap(new Map([[uid, name]]));
+
+      // Create tracks with specific configurations
+      const [audioTrack, videoTrack] = await AgoraRTC.createMicrophoneAndCameraTracks(
+        {
+          encoderConfig: "high_quality",
+          stereo: true,
+          AEC: true,
+          ANS: true,
+        },
+        {
+          encoderConfig: "1080p_2",
+          facingMode: "user",
+          optimizationMode: "detail",
+        }
+      );
+
+      // Publish local tracks
       await agoraClient.publish([audioTrack, videoTrack]);
-      
+
       setLocalAudioTrack(audioTrack);
       setLocalVideoTrack(videoTrack);
-      
+
+      // Play local video
       videoTrack.play('local-video');
-      
+
+      // Handle remote users
       agoraClient.on('user-published', async (user, mediaType) => {
         await agoraClient.subscribe(user, mediaType);
-        
+
         if (mediaType === 'video') {
+          // Get user name from channel attributes
+          const remoteName = user.addInjectStreamUrl || `User ${user.uid}`;
+          
           setUsers(prevUsers => {
             if (!prevUsers.find(u => u.uid === user.uid)) {
+              setUserMap(prevMap => new Map(prevMap).set(user.uid, remoteName));
               return [...prevUsers, user];
             }
             return prevUsers;
           });
-          user.videoTrack.play(`remote-video-${user.uid}`);
+
+          // Play remote video with specific configurations
+          if (user.videoTrack) {
+            user.videoTrack.play(`remote-video-${user.uid}`, {
+              fit: 'contain',
+              mirror: false
+            });
+          }
         }
+
         if (mediaType === 'audio') {
-          user.audioTrack.play();
+          user.audioTrack?.play();
         }
       });
 
-      agoraClient.on('user-unpublished', (user) => {
+      agoraClient.on('user-unpublished', (user, mediaType) => {
+        if (mediaType === 'video') {
+          const playerElement = document.getElementById(`remote-video-${user.uid}`);
+          if (playerElement) {
+            playerElement.innerHTML = '';
+          }
+        }
+      });
+
+      agoraClient.on('user-left', (user) => {
         setUsers(prevUsers => prevUsers.filter(u => u.uid !== user.uid));
+        setUserMap(prevMap => {
+          const newMap = new Map(prevMap);
+          newMap.delete(user.uid);
+          return newMap;
+        });
       });
 
       setJoinState('joined');
@@ -88,112 +272,21 @@ export default function VideoCall() {
     }
   };
 
-  const cleanup = async () => {
-    if (localAudioTrack) {
-      localAudioTrack.close();
-    }
-    if (localVideoTrack) {
-      localVideoTrack.close();
-    }
-    if (screenTrack) {
-      screenTrack.close();
-    }
-    if (client) {
-      await client.leave();
-    }
-    setJoinState('init');
-  };
-
-  const toggleMute = async () => {
-    if (localAudioTrack) {
-      localAudioTrack.setEnabled(!isMuted);
-      setIsMuted(!isMuted);
-    }
-  };
-
-  const toggleCamera = async () => {
-    if (localVideoTrack) {
-      localVideoTrack.setEnabled(!isCameraOn);
-      setIsCameraOn(!isCameraOn);
-    }
-  };
-
-  const toggleScreenSharing = async () => {
-    if (!isScreenSharing && client) {
-      try {
-        if (localVideoTrack) {
-          await client.unpublish(localVideoTrack);
-          localVideoTrack.stop();
-        }
-
-        const screenTrack = await AgoraRTC.createScreenVideoTrack({
-          encoderConfig: '1080p_1',
-          optimizationMode: 'detail',
-        });
-
-        await client.publish(screenTrack);
-        setScreenTrack(screenTrack);
-        screenTrack.play('local-video');
-        setIsScreenSharing(true);
-
-        // Handle screen share stopped by user through browser UI
-        screenTrack.on('track-ended', async () => {
-          await stopScreenSharing();
-        });
-      } catch (error) {
-        console.error('Error sharing screen:', error);
-        handleScreenSharingError(error);
-        await stopScreenSharing();
-      }
-    } else {
-      await stopScreenSharing();
-    }
-  };
-
-  const stopScreenSharing = async () => {
-    try {
-      if (screenTrack) {
-        await client.unpublish(screenTrack);
-        screenTrack.close();
-        setScreenTrack(null);
-      }
-
-      if (localVideoTrack) {
-        await client.publish(localVideoTrack);
-        if (isCameraOn) {
-          localVideoTrack.play('local-video');
-        }
-      }
-      
-      setIsScreenSharing(false);
-    } catch (error) {
-      console.error('Error stopping screen share:', error);
-      alert('Failed to stop screen sharing. Please try again.');
-    }
-  };
-
-  const handleScreenSharingError = (error) => {
-    if (error.name === 'NotAllowedError' || error.message.includes('Permission denied')) {
-      alert('Please allow screen sharing permission to use this feature.');
-    } else if (error.message.includes('CAN_NOT_PUBLISH_MULTIPLE_VIDEO_TRACKS')) {
-      alert('Cannot share screen while camera is active. Please try again.');
-    } else {
-      alert('Failed to start screen sharing. Please try again.');
-    }
-  };
-
-  const copyLinkToClipboard = () => {
-    navigator.clipboard.writeText(shareableLink)
-      .then(() => alert('Meeting link copied to clipboard!'))
-      .catch(() => alert('Failed to copy link. Please try again.'));
-  };
-
-  const endCall = async () => {
-    await cleanup();
-    if (typeof window !== 'undefined') {
-      window.location.href = '/';
-    }
-  };
+  if (!roomId) {
+    return (
+      <div className="min-h-screen bg-gray-100 flex items-center justify-center p-4">
+        <div className="bg-white rounded-lg shadow-lg p-6 max-w-md w-full">
+          <h2 className="text-2xl font-bold mb-4">Video Call</h2>
+          <button
+            onClick={createNewMeeting}
+            className="w-full bg-blue-500 text-white rounded p-2 mb-4 hover:bg-blue-600"
+          >
+            Create New Meeting
+          </button>
+        </div>
+      </div>
+    );
+  }
 
   if (joinState === 'init') {
     return (
@@ -221,23 +314,13 @@ export default function VideoCall() {
           >
             Join Call
           </button>
-          {!searchParams.get('room') && (
-            <button
-              onClick={copyLinkToClipboard}
-              className="w-full bg-green-500 text-white rounded p-2 hover:bg-green-600"
-            >
-              Copy Meeting Link
-            </button>
-          )}
+          <button
+            onClick={copyLinkToClipboard}
+            className="w-full bg-green-500 text-white rounded p-2 hover:bg-green-600"
+          >
+            Copy Meeting Link
+          </button>
         </div>
-      </div>
-    );
-  }
-
-  if (joinState === 'joining') {
-    return (
-      <div className="min-h-screen bg-gray-100 flex items-center justify-center">
-        <div className="text-xl">Joining call...</div>
       </div>
     );
   }
@@ -247,12 +330,17 @@ export default function VideoCall() {
       <div className="max-w-6xl mx-auto">
         <div className="mb-4 flex justify-between items-center">
           <h2 className="text-xl font-bold">Room: {roomId}</h2>
-          <button
-            onClick={copyLinkToClipboard}
-            className="bg-green-500 text-white rounded px-4 py-2 hover:bg-green-600"
-          >
-            Share Meeting Link
-          </button>
+          <div className="flex items-center space-x-4">
+            <span className="text-gray-600">
+              {users.length + 1} participant{users.length !== 0 ? 's' : ''} in call
+            </span>
+            <button
+              onClick={copyLinkToClipboard}
+              className="bg-green-500 text-white rounded px-4 py-2 hover:bg-green-600"
+            >
+              Share Meeting Link
+            </button>
+          </div>
         </div>
 
         <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
@@ -268,12 +356,12 @@ export default function VideoCall() {
               {userName} (You)
             </div>
           </div>
-          
+
           {users.map(user => (
             <div key={user.uid} className="relative bg-black rounded-lg overflow-hidden">
               <div id={`remote-video-${user.uid}`} className="w-full h-64 md:h-96"></div>
               <div className="absolute bottom-4 left-4 text-white bg-black bg-opacity-50 px-2 py-1 rounded">
-                Remote User
+                {userMap.get(user.uid) || `User ${user.uid}`}
               </div>
             </div>
           ))}
@@ -286,14 +374,14 @@ export default function VideoCall() {
           >
             {isMuted ? 'Unmute' : 'Mute'}
           </button>
-          
+
           <button
             onClick={toggleCamera}
             className={`p-3 rounded-full ${!isCameraOn ? 'bg-red-500' : 'bg-gray-200'} text-black`}
           >
             {isCameraOn ? 'Stop Camera' : 'Start Camera'}
           </button>
-          
+
           <button
             onClick={toggleScreenSharing}
             className={`p-3 rounded-full ${isScreenSharing ? 'bg-green-500' : 'bg-gray-200'} text-black`}
