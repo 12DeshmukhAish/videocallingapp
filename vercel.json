@@ -1,11 +1,5 @@
 {
-    "version": 2,
-    "builds": [
-      {
-        "src": "next.config.js",
-        "use": "@vercel/next"
-      }
-    ],
+  
     "env": {
       "NEXT_PUBLIC_AGORA_APP_ID": "62fea805d64a4309855fc570e154cfce"
     }
